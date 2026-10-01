@@ -1,0 +1,465 @@
+"""Profile the actual test_speedup.py kernels on TPU, following NeuronMM's workflow.
+
+Compile/warm up first, measure without tracing, then capture device activity.
+Run --help or read PROFILER_TPU.md. --dry-run only computes source-level traffic.
+"""
+from __future__ import annotations
+
+import argparse
+import ast
+from collections import Counter
+import csv
+from datetime import datetime, timezone
+import functools
+import gzip
+import hashlib
+import inspect
+import json
+import math
+from pathlib import Path
+import statistics
+import sys
+import time
+import types
+
+if not __package__:
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from svdflash_tpu import test_speedup as kernels
+
+PARAM_KEYS = ("M_tiles_in_block", "r_tiles_in_block", "K_tiles_in_block", "N_tiles_in_block")
+WORKLOADS = ("gate-up", "down", "fused", "unfused")
+DEVICE_TRACE_OPTIONS = {
+    "xla_enable_custom_call_region_trace": True,
+    "xla_enable_local_dma_trace": True,
+    "xla_enable_mxu_trace": True,
+    "xla_enable_transpose_trace": True,
+}
+
+
+def positive(value):
+    number = int(value)
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be positive")
+    return number
+
+
+def tile_params(value):
+    try:
+        values = tuple(int(v) for v in value.split(","))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("use M,r,K,N, e.g. 4,2,1,2") from error
+    if len(values) != 4 or min(values) <= 0:
+        raise argparse.ArgumentTypeError("use four positive integers: M,r,K,N")
+    return dict(zip(PARAM_KEYS, values))
+
+
+def traffic_model(M, R, S, N, dtype, params, gate, async_dma=True):
+    """Explicit kernel copies per invocation, across all sequence blocks.
+
+    This is NOT a device counter. Excludes launcher padding/cropping, VMEM
+    loads/stores, spills, layout copies, and compiler changes to DMA lowering.
+    """
+    shape = kernels._fusion_shape(M, R, S, N, dtype, *(params[k] for k in PARAM_KEYS), gate, async_dma=async_dma)
+    mb, rb, kb, nb, mp, rp, sp, npad, vmem = shape
+    mt, rt, kt, nt = (params[k] for k in PARAM_KEYS)
+    sm, mm, rr, nn = sp // kb, mp // mb, (rp + rb - 1) // rb, npad // nb
+    itemsize = jnp.dtype(dtype).itemsize
+    rows = []
+
+    def add(tensor, direction, count, tile):
+        size = math.prod(tile) * itemsize
+        rows.append(dict(tensor=tensor, direction=direction, copy_calls=count,
+                         copy_shape=list(tile), bytes_per_copy=size, total_bytes=count * size))
+
+    _, cache_rows = kernels._projection_memory(mb, rb, kb, nb, mp, rp, npad, dtype, gate, async_dma)
+    input_passes = sm if cache_rows == mp else sm*rr
+    add("X", "HBM_to_VMEM", input_passes * (mp//kernels.M_TILE if gate else mp//cache_rows),
+        (kb, kernels.M_TILE) if gate else (cache_rows, kb))
+    branches = ("gate", "up") if gate else ("down",)
+    hbm_rank = kernels._round_up(R, kernels.R_TILE)
+    full_rank_blocks, tail_rank = divmod(hbm_rank, rb)
+    for branch in branches:
+        for rank_blocks, rank_rows in ((full_rank_blocks, rb), (int(tail_rank > 0), tail_rank)):
+            if rank_blocks:
+                add(branch + "_U", "HBM_to_VMEM", sm * mm * rank_blocks, (mb, rank_rows))
+                add(branch + "_V", "HBM_to_VMEM", sm * nn * rank_blocks, (rank_rows, nb))
+    add("output", "VMEM_to_HBM", sm * nn * (nt if gate else kt),
+        (kernels.N_TILE, kb) if gate else (kernels.K_TILE, nb))
+    return dict(
+        params=params, logical_shape=dict(M=M, rank=R, S=S, N=N),
+        padded_shape=dict(M=mp, rank=rp, S=sp, N=npad),
+        hbm_shape=dict(M=mp, rank=hbm_rank, S=sp, N=npad),
+        block_shape=dict(M=mb, rank=rb, S=kb, N=nb),
+        estimated_vmem_bytes=vmem, sequence_blocks=sm,
+        async_dma=async_dma,
+        weight_buffer_slots=dict(
+            U=2 if async_dma and mm*rr > 1 else 1,
+            V=2 if async_dma and nn*rr > 1 else 1),
+        input_passes=input_passes, input_cache_rows=cache_rows,
+        computed_rank=rp,
+        contraction_accumulator_dtype="float32",
+        weight_passes=sm, transfers=rows,
+        source_copy_calls=sum(row["copy_calls"] for row in rows),
+        hbm_read_bytes=sum(row["total_bytes"] for row in rows if row["direction"] == "HBM_to_VMEM"),
+        hbm_write_bytes=sum(row["total_bytes"] for row in rows if row["direction"] == "VMEM_to_HBM"),
+    )
+
+
+def _scoped_call(label, fn, *args, **kwargs):
+    with jax.named_scope(label):
+        return fn(*args, **kwargs)
+
+
+def _profile_sync_copy(label, source, destination, *, add=False):
+    """Same single-ref start/wait semantics as pltpu.sync_copy, with markers."""
+    pl, tpu = kernels.pl, kernels.pltpu
+
+    @functools.partial(pl.run_scoped, sem=tpu.SemaphoreType.DMA(()))
+    def copy(sem):
+        descriptor = tpu.make_async_copy(source, destination, sem)
+        with jax.named_scope(label + "/start"):
+            descriptor.start(add=add)
+        with jax.named_scope(label + "/wait"):
+            descriptor.wait()
+
+
+class _DeviceScopes(ast.NodeTransformer):
+    """Add device scopes to a private copy of the real kernel source.
+
+    Preserve loops, indexing, shapes and math; do not maintain a second kernel.
+    Host TraceAnnotation around Python tracing would not time device DMA.
+    """
+    def __init__(self):
+        self.functions = []
+
+    def visit_FunctionDef(self, node):
+        self.functions.append(node.name)
+        self.generic_visit(node)
+        self.functions.pop()
+        return node
+
+    def visit_Call(self, node):
+        self.generic_visit(node)
+        active = set(self.functions)
+        # New shared projection scopes carry their own gate/down and MXU labels.
+        if "_stream_projection" in active:
+            if (isinstance(node.func, ast.Attribute) and
+                isinstance(node.func.value, ast.Name) and node.func.value.id == "pltpu" and
+                node.func.attr == "sync_copy"):
+                return ast.copy_location(ast.Call(
+                    func=ast.Name(id="_profile_sync_copy", ctx=ast.Load()),
+                    args=[ast.Constant("DMA/output"), *node.args], keywords=node.keywords), node)
+            return node
+        if "_wait_weight_block" in active and isinstance(node.func, ast.Attribute) and node.func.attr == "wait":
+            return ast.copy_location(ast.Call(
+                func=ast.Name(id="_scoped_call", ctx=ast.Load()),
+                args=[ast.Constant("DMA/weights/wait"), node.func, *node.args], keywords=node.keywords), node)
+        if not active.intersection({"fused_mlp_up_T", "fused_three_mm_XTUV",
+                                    "load_tensor_block", "load_tensor_block_T", "_load_weight_block"}):
+            return node
+        stage = "gate_up" if "fused_mlp_up_T" in active else "down"
+        name = node.func.id if isinstance(node.func, ast.Name) else None
+        label = None
+        if name in ("load_tensor_block", "load_tensor_block_T", "_load_weight_block"):
+            source = ast.unparse(node.args[0])
+            label = stage + "/HBM_to_VMEM/" + source
+        elif name == "_dot":
+            source = ast.unparse(node.args[0])
+            phase = "XU" if source.startswith("U_tile") else "XUV"
+            label = stage + "/MXU/" + phase
+        elif (isinstance(node.func, ast.Attribute)
+              and isinstance(node.func.value, ast.Name) and node.func.value.id == "pltpu"):
+            if node.func.attr == "async_copy":
+                return ast.copy_location(ast.Call(
+                    func=ast.Name(id="_scoped_call", ctx=ast.Load()),
+                    args=[ast.Constant("DMA/weights/start"), node.func, *node.args], keywords=node.keywords), node)
+            if node.func.attr == "sync_copy":
+                label = "DMA" if active.intersection({"load_tensor_block", "load_tensor_block_T", "_load_weight_block"}) else stage + "/output_DMA"
+                return ast.copy_location(ast.Call(
+                    func=ast.Name(id="_profile_sync_copy", ctx=ast.Load()),
+                    args=[ast.Constant(label), *node.args], keywords=node.keywords), node)
+            if node.func.attr == "store" and "load_tensor_block_T" in active:
+                label = "layout/transpose_X"
+        if label is None:
+            return node
+        return ast.copy_location(ast.Call(
+            func=ast.Name(id="_scoped_call", ctx=ast.Load()),
+            args=[ast.Constant(label), node.func, *node.args], keywords=node.keywords), node)
+
+
+def instrumented_kernels():
+    source = Path(kernels.__file__).read_text(encoding="utf-8-sig")
+    tree = ast.fix_missing_locations(_DeviceScopes().visit(ast.parse(source)))
+    module = types.ModuleType("svdflash_tpu._profiled_speedup")
+    module.__file__ = kernels.__file__
+    module.__dict__.update(_scoped_call=_scoped_call, _profile_sync_copy=_profile_sync_copy)
+    exec(compile(tree, kernels.__file__, "exec"), module.__dict__)
+    return module
+
+
+def build_workloads(module, x, factors, hidden_t, up, down, interpret=False, async_dma=True):
+    uu, vu, ug, vg, ud, vd = factors
+    mixed = x.dtype == jnp.bfloat16
+
+    def options(fn):
+        result = dict(mixed_precision=mixed, interpret=interpret)
+        # Historical saved kernels predate the async_dma keyword.
+        if "async_dma" in inspect.signature(fn).parameters:
+            result["async_dma"] = async_dma
+        return result
+
+    def gate_fn(x, ug, vg, uu, vu):
+        fn = module.fused_mlp_up_T
+        return fn(x, ug, vg, uu, vu, **up, **options(fn))
+
+    def down_fn(hidden_t, ud, vd):
+        fn = module.fused_three_mm_XTUV
+        return fn(hidden_t, ud, vd, **down, **options(fn))
+
+    def fused_fn(x, *f):
+        fn = module.svd_mlp_with_fused_kernel
+        return fn(x, *f, up, down, **options(fn))
+
+    def unfused_fn(x, *f):
+        with jax.default_matmul_precision("highest"):
+            return module._unfused_low_rank(x, *f)
+
+    return {"gate-up": (gate_fn, (x, ug, vg, uu, vu)),
+            "down": (down_fn, (hidden_t, ud, vd)),
+            "fused": (fused_fn, (x, *factors)),
+            "unfused": (unfused_fn, (x, *factors))}
+
+
+def _compile(fn, call_args, warmup, compiler_options=None):
+    start = time.perf_counter()
+    compiled = jax.jit(fn).lower(*call_args).compile(compiler_options=compiler_options)
+    for _ in range(max(warmup, 1)):
+        jax.block_until_ready(compiled(*call_args))
+    return compiled, time.perf_counter() - start
+
+
+def _measure(compiled, call_args, repeats):
+    samples = []
+    for _ in range(repeats):
+        start = time.perf_counter_ns()
+        jax.block_until_ready(compiled(*call_args))
+        samples.append((time.perf_counter_ns() - start) / 1e6)
+    return dict(median_ms=statistics.median(samples), min_ms=min(samples),
+                max_ms=max(samples), samples_ms=samples)
+
+
+def trace_inventory(directory):
+    """Confirm device events/markers exist; never mistake host regions for DMA."""
+    paths = sorted(directory.rglob("perfetto_trace.json.gz"))
+    if not paths:
+        paths = sorted(directory.rglob("*.trace.json.gz"))
+    if not paths:
+        return {"checked": False, "reason": "JSON trace unavailable; inspect XPlane with XProf"}
+    with gzip.open(paths[0], "rt", encoding="utf-8") as f:
+        events = json.load(f)["traceEvents"]
+    devices = {event["pid"]: event.get("args", {}).get("name", "")
+               for event in events if event.get("name") == "process_name"
+               and "TPU" in event.get("args", {}).get("name", "")}
+    names = Counter(event.get("name", "") for event in events
+                    if event.get("pid") in devices and event.get("ph") == "X")
+    markers = {name: count for name, count in sorted(names.items())
+               if any(s in name for s in ("HBM_to_VMEM", "DMA/", "/MXU/", "transpose_X"))}
+    return {"checked": True, "device_processes": list(devices.values()),
+            "device_event_count": sum(names.values()), "marker_event_counts": markers,
+            "note": "Trace event counts, not DMA byte counters; nested/derived tracks may duplicate regions"}
+
+
+def capture(name, compiled, call_args, directory, steps, perfetto):
+    directory.mkdir(parents=True, exist_ok=False)
+    options = jax.profiler.ProfileOptions()
+    options.host_tracer_level = 2
+    options.python_tracer_level = 0
+    options.enable_hlo_proto = True
+    with jax.profiler.trace(str(directory), create_perfetto_trace=perfetto,
+                            profiler_options=options):
+        for step in range(steps):
+            with jax.profiler.StepTraceAnnotation(name, step_num=step):
+                jax.block_until_ready(compiled(*call_args))
+    files = sorted(str(p.relative_to(directory)) for p in directory.rglob("*") if p.is_file())
+    if not any(p.endswith(".xplane.pb") for p in files):
+        raise RuntimeError(f"No XPlane was exported to {directory}; inspect profiler runtime errors")
+    return dict(directory=str(directory), files=files, steps=steps,
+                inventory=trace_inventory(directory))
+
+
+def parser():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("--model-path", help="local real SVD checkpoint (one layer only)")
+    p.add_argument("--layer", type=int, default=0)
+    p.add_argument("--seq-len", type=positive, default=128)
+    p.add_argument("--hidden", type=positive)
+    p.add_argument("--intermediate", type=positive)
+    p.add_argument("--rank", type=positive)
+    p.add_argument("--dtype", choices=("bf16", "fp32"))
+    p.add_argument("--up-tiles", type=tile_params, help="M,r,K,N; default from test_speedup")
+    p.add_argument("--down-tiles", type=tile_params, help="M,r,K,N; default from test_speedup")
+    p.add_argument("--workloads", nargs="+", choices=WORKLOADS, default=list(WORKLOADS))
+    p.add_argument("--warmup", type=positive, default=5)
+    p.add_argument("--repeats", type=positive, default=30)
+    p.add_argument("--trace-steps", type=positive, default=5)
+    p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--max-relative-l2", type=float, default=None)
+    p.add_argument("--trace-root", default="svdflash_tpu/profiles")
+    p.add_argument("--device-scopes", action="store_true",
+                   help="add DMA start/wait and MXU scopes to a private kernel copy")
+    p.add_argument("--perfetto", action="store_true")
+    p.add_argument("--dump-hlo", action="store_true", help="save uninstrumented compiled HLO")
+    p.add_argument("--sync-dma", action="store_true", help="profile the synchronous weight baseline")
+    p.add_argument("--dry-run", action="store_true", help="print static traffic, without initializing TPU")
+    return p
+
+
+def _save(report, directory):
+    (directory / "manifest.json").write_text(
+        json.dumps(report, indent=2, allow_nan=False), encoding="utf-8")
+
+
+def main(argv=None):
+    args = parser().parse_args(argv)
+    if args.layer < 0:
+        raise ValueError("layer must be nonnegative")
+    if args.max_relative_l2 is not None and (
+            not math.isfinite(args.max_relative_l2) or args.max_relative_l2 <= 0):
+        raise ValueError("max-relative-l2 must be positive and finite")
+    metadata = None
+    if args.model_path:
+        if any(v is not None for v in (args.hidden, args.intermediate, args.rank)):
+            raise ValueError("checkpoint shapes come from tensors; omit --hidden/--intermediate/--rank")
+        from svdflash_tpu.bench.checkpoint_speedup import inspect_mlp_checkpoint
+        metadata = inspect_mlp_checkpoint(args.model_path, [args.layer])
+        H, I, R = metadata["hidden_size"], metadata["intermediate_size"], metadata["layers"][0]["rank"]
+        dtype = args.dtype or ("bf16" if metadata["layers"][0]["dtype"] == "BF16" else "fp32")
+    else:
+        H, I, R = args.hidden or 4096, args.intermediate or 14336, args.rank or 2816
+        dtype = args.dtype or "bf16"
+    dtype = jnp.bfloat16 if dtype == "bf16" else jnp.float32
+    S = args.seq_len
+    up = args.up_tiles or kernels.get_fused_mlp_up_T_params(S)
+    down = args.down_tiles or kernels.get_fused_three_mm_XTUV_params(S)
+    traffic = {"gate-up": traffic_model(H, R, S, I, dtype, up, True, async_dma=not args.sync_dma),
+               "down": traffic_model(I, R, S, H, dtype, down, False, async_dma=not args.sync_dma)}
+    report = dict(
+        complete=False, async_dma=not args.sync_dma, shape=dict(H=H, I=I, rank=R, S=S), dtype=str(jnp.dtype(dtype)),
+        kernel_source=str(Path(kernels.__file__).resolve()),
+        kernel_sha256=hashlib.sha256(Path(kernels.__file__).read_bytes()).hexdigest(),
+        checkpoint=metadata, input_kind="synthetic_normal", seed=args.seed,
+        traffic_source="static explicit kernel copies, NOT measured DMA counters",
+        traffic_excludes=["launcher padding/cropping", "VMEM internal loads/stores",
+                          "spills", "compiler layout copies and DMA lowering changes"],
+        traffic=traffic, profiles={}, device_scopes=args.device_scopes,
+        trace_compiler_options=DEVICE_TRACE_OPTIONS if args.device_scopes else {},
+        timing="untraced host wall-clock with block_until_ready; median excludes compile, load, trace",
+        trace_scope="steady-state device execution; DMA start/wait scopes are not bandwidth counters",
+    )
+    if args.dry_run:
+        print(json.dumps(report, indent=2))
+        return report
+    if jax.default_backend() != "tpu":
+        raise RuntimeError("Device profiling requires TPU; use --dry-run for static inspection")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
+    directory = Path(args.trace_root).resolve() / f"{stamp}_layer{args.layer}_S{S}"
+    directory.mkdir(parents=True, exist_ok=False)
+    report.update(jax=jax.__version__, devices=[str(d) for d in jax.devices()],
+                  warmup=args.warmup, repeats=args.repeats, run_dir=str(directory))
+    _save(report, directory)
+    with (directory / "static_traffic.csv").open("w", newline="", encoding="utf-8") as f:
+        fields = ("stage", "tensor", "direction", "copy_calls", "copy_shape", "bytes_per_copy", "total_bytes")
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        for stage, model in traffic.items():
+            for row in model["transfers"]:
+                writer.writerow(dict(stage=stage, **row))
+    try:
+        rng = np.random.default_rng(args.seed)
+        x = jnp.asarray(rng.standard_normal((S, H), dtype=np.float32), dtype=dtype)
+        if args.model_path:
+            from svdflash_tpu.bench.checkpoint_speedup import load_mlp_factors
+            loaded, = load_mlp_factors(args.model_path, [args.layer])
+            ug, vg, uu, vu, ud, vd = loaded
+            factors = tuple(a.astype(dtype) for a in (uu, vu, ug, vg, ud, vd))
+            del loaded, ug, vg, uu, vu, ud, vd
+        else:
+            shapes = ((H, R), (R, I), (H, R), (R, I), (I, R), (R, H))
+            factors = tuple(jnp.asarray(rng.standard_normal(shape, dtype=np.float32)
+                                       / math.sqrt(shape[0]), dtype=dtype) for shape in shapes)
+        jax.block_until_ready((x, factors))
+        # Build the isolated down input from the exact fused gate, outside capture.
+        uu, vu, ug, vg, ud, vd = factors
+        print("Preparing Gate/Up and verifying full MLP against FP32...", flush=True)
+        gate_fn = lambda x, ug, vg, uu, vu: kernels.fused_mlp_up_T(
+            x, ug, vg, uu, vu, **up, mixed_precision=dtype == jnp.bfloat16, async_dma=not args.sync_dma)
+        gate_compiled, _ = _compile(gate_fn, (x, ug, vg, uu, vu), 1)
+        hidden_t = jax.block_until_ready(gate_compiled(x, ug, vg, uu, vu))
+        workloads = build_workloads(kernels, x, factors, hidden_t, up, down, async_dma=not args.sync_dma)
+        reference = jax.jit(lambda x, *f: _reference(x, *f))
+        expected = np.asarray(reference(x, *factors), dtype=np.float32)
+        tolerance = args.max_relative_l2 or (0.12 if dtype == jnp.bfloat16 else 0.001)
+        from svdflash_tpu.bench.checkpoint_speedup import _errors
+        compiled_workloads = {}
+        for name in dict.fromkeys((*args.workloads, "fused", "unfused")):
+            fn, inputs = workloads[name]
+            print(f"Compiling/warming {name}...", flush=True)
+            compiled, seconds = _compile(fn, inputs, args.warmup)
+            compiled_workloads[name] = compiled
+            if name in ("fused", "unfused"):
+                errors = _errors(np.asarray(compiled(*inputs)), expected)
+                report.setdefault("verification", {})[name] = errors
+                if errors["relative_l2"] > tolerance:
+                    raise RuntimeError(f"{name} relative L2 {errors['relative_l2']} exceeds {tolerance}")
+            if name not in args.workloads:
+                continue
+            entry = dict(compile_and_warmup_seconds=seconds,
+                         latency=_measure(compiled, inputs, args.repeats))
+            report["profiles"][name] = entry
+            if args.dump_hlo:
+                (directory / f"{name}.hlo.txt").write_text(compiled.as_text(), encoding="utf-8")
+            print(f"{name}: {entry['latency']['median_ms']:.4f} ms (untraced)", flush=True)
+            _save(report, directory)
+        scoped = build_workloads(instrumented_kernels(), x, factors, hidden_t, up, down, async_dma=not args.sync_dma) if args.device_scopes else None
+        for name in dict.fromkeys(args.workloads):
+            compiled, inputs = compiled_workloads[name], workloads[name][1]
+            if scoped is not None:
+                fn, inputs = scoped[name]
+                print(f"Compiling device markers for {name}...", flush=True)
+                traced, _ = _compile(fn, inputs, args.warmup, DEVICE_TRACE_OPTIONS)
+                # Instrumentation must preserve results before collecting its trace.
+                np.testing.assert_allclose(np.asarray(traced(*inputs), dtype=np.float32),
+                                           np.asarray(compiled(*inputs), dtype=np.float32),
+                                           rtol=1e-5, atol=1e-5)
+                compiled = traced
+            print(f"Capturing {name}...", flush=True)
+            report["profiles"][name]["trace"] = capture(
+                name, compiled, inputs, directory / name, args.trace_steps, args.perfetto)
+            inventory = report["profiles"][name]["trace"]["inventory"]
+            if not inventory.get("device_event_count"):
+                print(f"WARNING: no TPU device events confirmed for {name}; inspect XProf", flush=True)
+            elif args.device_scopes and name != "unfused" and not inventory["marker_event_counts"]:
+                print(f"WARNING: no DMA/MXU scopes found for {name}; inspect runtime trace settings", flush=True)
+            _save(report, directory)
+        report["complete"] = True
+    except Exception as error:
+        report["error"] = f"{type(error).__name__}: {error}"
+        _save(report, directory)
+        raise
+    _save(report, directory)
+    print(f"Saved {directory / 'manifest.json'}", flush=True)
+    print(f"xprof server --logdir {directory} --port 6006", flush=True)
+    return report
+
+
+def _reference(x, *factors):
+    with jax.default_matmul_precision("highest"):
+        return kernels._unfused_reference(x, *factors)
+
+
+if __name__ == "__main__":
+    main()

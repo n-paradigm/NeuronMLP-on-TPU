@@ -1,0 +1,240 @@
+"""CPU interpretation tests for the NeuronMM-compatible migration."""
+import ast
+from pathlib import Path
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from svdflash_tpu import test_speedup as t
+
+
+ONE = dict(M_tiles_in_block=1, r_tiles_in_block=1,
+           K_tiles_in_block=1, N_tiles_in_block=1)
+
+
+def random_arrays(shapes, dtype=jnp.float32):
+    rng = np.random.default_rng(123)
+    return [jnp.asarray(rng.normal(size=s).astype(np.float32) / np.sqrt(s[0]), dtype)
+            for s in shapes]
+
+
+def assert_close(actual, expected, tol=1e-4):
+    np.testing.assert_allclose(np.asarray(actual, dtype=np.float32),
+                               np.asarray(expected, dtype=np.float32), atol=tol, rtol=tol)
+
+
+@pytest.mark.parametrize("transpose", [False, True])
+def test_loaders_nonzero_offsets_and_multiple_tiles(transpose):
+    mesh, interpretation = t._mesh(True)
+    source = jnp.arange(1024*1024, dtype=jnp.float32).reshape(1024, 1024)
+    @t.pl.kernel(mesh=mesh, interpret=interpretation,
+                 out_type=jax.ShapeDtypeStruct((512, 128), jnp.float32),
+                 scratch_types=(t._vmem_type(mesh, True, (512, 128), jnp.float32),
+                                t._vmem_type(mesh, True, (128, 256), jnp.float32)))
+    def kernel(src, out, cache, staging):
+        if transpose:
+            t.load_tensor_block_T(src, cache, (128, 256), (2, 256, 128),
+                                  staging_ref=staging)
+        else:
+            t.load_tensor_block(src, cache, (256, 128), (2, 256, 128))
+        t.pltpu.sync_copy(cache, out)
+    expected = source[128:256, 256:768].T if transpose else source[256:768, 128:256]
+    assert_close(kernel(source), expected, 0)
+
+
+@pytest.mark.parametrize("S,H,R,I", [(1, 129, 131, 137), (129, 257, 257, 513)])
+def test_fused_gate_and_down_tail_blocks(S, H, R, I):
+    x, ug, vg, uu, vu, ud, vd = random_arrays(
+        [(S, H), (H, R), (R, I), (H, R), (R, I), (I, R), (R, H)])
+    got_t = t.fused_mlp_up_T(x, ug, vg, uu, vu, **ONE,
+                            mixed_precision=False, interpret=True)
+    gate = (np.asarray(x) @ np.asarray(ug)) @ np.asarray(vg)
+    up = (np.asarray(x) @ np.asarray(uu)) @ np.asarray(vu)
+    hidden = gate / (1 + np.exp(-gate)) * up
+    assert got_t.shape == (I, S)
+    assert_close(got_t, hidden.T)
+    got = t.fused_three_mm_XTUV(got_t, ud, vd, **ONE,
+                               mixed_precision=False, interpret=True)
+    assert got.shape == (S, H)
+    assert_close(got, (hidden @ np.asarray(ud)) @ np.asarray(vd))
+
+
+def test_multiple_inner_tiles():
+    x, ug, vg, uu, vu = random_arrays([(257, 513), (513, 513), (513, 1025),
+                                      (513, 513), (513, 1025)])
+    params = {name: 2 for name in ONE}
+    got = t.fused_mlp_up_T(x, ug, vg, uu, vu, **params,
+                          mixed_precision=False, interpret=True, async_dma=False)
+    gate, up = (x @ ug) @ vg, (x @ uu) @ vu
+    assert_close(got, (jax.nn.silu(gate) * up).T)
+
+
+def test_dense_loop_order_and_tails():
+    a, b = random_arrays([(513, 257), (513, 1025)])
+    got = t.nki_matmul_fully_optimized_(a, b, 2, 2, 2,
+                                       mixed_precision=False, interpret=True)
+    assert_close(got, np.asarray(a).T @ np.asarray(b))
+
+
+def test_wrappers_preserve_pytorch_weight_order():
+    x, uu, vu, ug, vg, ud, vd = random_arrays(
+        [(1, 129), (129, 131), (131, 137), (129, 131), (131, 137), (137, 131), (131, 129)])
+    got = t.nki_mm(x, uu.T, vu.T, ug.T, vg.T, ud.T, vd.T,
+                   mixed_precision=False, interpret=True, up_T_params=ONE, XTUV_params=ONE)
+    expected = t._unfused_reference(x, uu, vu, ug, vg, ud, vd)
+    assert_close(got, expected)
+    dense = t.nki_baseline(x, (uu @ vu).T, (ug @ vg).T, (ud @ vd).T,
+                           mixed_precision=False, interpret=True,
+                           matmul_params=dict(TILES_IN_BLOCK_M=1, TILES_IN_BLOCK_N=1,
+                                              TILES_IN_BLOCK_K=1))
+    assert_close(dense, expected)
+
+
+def test_bf16_down_block_rounding_matches_independent_reference():
+    # Two blocks along both contractions expose the original BF16 += semantics.
+    xt, u, v = random_arrays([(513, 3), (513, 257), (257, 7)], jnp.bfloat16)
+    got = t.fused_three_mm_XTUV(xt, u, v, **ONE, interpret=True)
+    xu = jnp.zeros((3, 257), jnp.bfloat16)
+    for start in range(0, 513, t.M_TILE):
+        part = xt[start:start+t.M_TILE].astype(jnp.float32).T @ u[start:start+t.M_TILE].astype(jnp.float32)
+        xu = (xu.astype(jnp.float32) + part).astype(jnp.bfloat16)
+    expected = jnp.zeros((3, 7), jnp.bfloat16)
+    for start in range(0, 257, t.R_TILE):
+        part = xu[:, start:start+t.R_TILE].astype(jnp.float32) @ v[start:start+t.R_TILE].astype(jnp.float32)
+        expected = (expected.astype(jnp.float32) + part).astype(jnp.bfloat16)
+    assert_close(got, expected, 0.001)
+
+
+@pytest.mark.parametrize("S", [1, 8, 13, 127, 128, 129, 512, 1024])
+def test_default_vmem_for_target_models(S):
+    for H, I, R in [(3072, 8192, 1792), (4096, 14336, 2560)]:
+        for gate, M, N, params in [
+            (True, H, I, t.get_fused_mlp_up_T_params(S)),
+            (False, I, H, t.get_fused_three_mm_XTUV_params(S))]:
+            shape = t._fusion_shape(M, R, S, N, jnp.bfloat16,
+                                     params["M_tiles_in_block"], params["r_tiles_in_block"],
+                                     params["K_tiles_in_block"], params["N_tiles_in_block"], gate)
+            assert shape.vmem_bytes < t.VMEM_LIMIT * t.VMEM_HEADROOM
+
+
+def test_invalid_configuration_rejected_before_launch():
+    a = jnp.zeros((8, 128), jnp.float32)
+    b = jnp.zeros((128, 128), jnp.float32)
+    with pytest.raises(ValueError, match="positive integer"):
+        t.fused_mlp_up_T(a, b, b, b, b, M_tiles_in_block=0, interpret=True)
+    with pytest.raises(ValueError, match="VMEM"):
+        t.fused_mlp_up_T(a, b, b, b, b, M_tiles_in_block=1024, interpret=True)
+    with pytest.raises(ValueError, match="matching shapes"):
+        t.fused_mlp_up_T(a, b, b, b[:, :64], b, interpret=True)
+    with pytest.raises(TypeError, match="same dtype"):
+        t.fused_three_mm_XTUV(a.T, b, b.astype(jnp.bfloat16), interpret=True)
+
+
+def test_all_original_entry_points_and_for_nesting():
+    original_path = Path(__file__).resolve().parents[2] / "NeuronMM/test_speedup.py"
+    if not original_path.exists():
+        pytest.skip("original NeuronMM tree is not present")
+    original = ast.parse(original_path.read_text(encoding="utf-8"))
+    migrated = ast.parse(Path(t.__file__).read_text(encoding="utf-8"))
+    old = {f.name: f for f in original.body if isinstance(f, ast.FunctionDef)}
+    new = {f.name: f for f in migrated.body if isinstance(f, ast.FunctionDef)}
+    assert old.keys() <= new.keys()
+    def for_paths(node, prefix=()):
+        paths = []
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.For):
+                path = prefix + (ast.unparse(child.target),)
+                paths.append(path)
+                paths.extend(for_paths(child, path))
+            else:
+                paths.extend(for_paths(child, prefix))
+        return paths
+    for name in ("fused_mlp_up_T", "fused_three_mm_XTUV", "nki_matmul_fully_optimized_"):
+        kernel = next(f for f in ast.walk(new[name])
+                      if isinstance(f, ast.FunctionDef) and f.name == "kernel")
+        assert for_paths(old[name]) == for_paths(kernel), name
+
+
+def test_cpu_benchmark_never_reports_speedup(capsys):
+    t.main(["--interpret", "--seq-lens", "1", "--hidden", "17",
+            "--intermediate", "19", "--rank", "11"])
+    output = capsys.readouterr().out
+    assert "interpret_correctness_only" in output
+    assert "relative_l2" in output
+    assert "speedup_vs_" not in output
+
+
+@pytest.mark.parametrize("tail_axis", [0, 1])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_weight_tail_clears_reused_cache(tail_axis, dtype):
+    mesh, interpretation = t._mesh(True)
+    source = jnp.asarray(np.random.default_rng(23).normal(size=(768, 768)), dtype)
+    offset = (512, 256) if tail_axis == 0 else (256, 512)
+
+    @t.pl.kernel(mesh=mesh, interpret=interpretation,
+                 out_type=jax.ShapeDtypeStruct((512, 512), dtype),
+                 scratch_types=(t._vmem_type(mesh, True, (512, 512), dtype),))
+    def kernel(src, out, cache):
+        # A complete block first leaves nonzero values in the reused cache.
+        t._load_weight_block(src, cache, (0, 0), (2, 256, 512))
+        t._load_weight_block(src, cache, offset, (2, 256, 512))
+        t.pltpu.sync_copy(cache, out)
+
+    nr, nc = min(512, 768-offset[0]), min(512, 768-offset[1])
+    expected = np.zeros((512, 512), np.float32)
+    expected[:nr, :nc] = np.asarray(source[offset[0]:offset[0]+nr,
+                                         offset[1]:offset[1]+nc], np.float32)
+    assert_close(kernel(source), expected, 0)
+
+
+def test_bf16_gate_rank_tail_against_blocked_reference():
+    # rank=513 -> HBM rank=768, VMEM rank=1024: exercise a partial rank block
+    # after a full block, and two input contractions with BF16 writeback.
+    x, ug, vg, uu, vu = random_arrays(
+        [(3, 513), (513, 513), (513, 17), (513, 513), (513, 17)], jnp.bfloat16)
+    params = dict(M_tiles_in_block=2, r_tiles_in_block=2,
+                  K_tiles_in_block=1, N_tiles_in_block=1)
+    got = t.fused_mlp_up_T(x, ug, vg, uu, vu, **params, interpret=True)
+
+    def project(u, v):
+        xu = jnp.zeros((3, 513), jnp.bfloat16)
+        for start in range(0, 513, 512):
+            part = x[:, start:start+512].astype(jnp.float32) @ u[start:start+512].astype(jnp.float32)
+            xu = (xu.astype(jnp.float32) + part).astype(jnp.bfloat16)
+        result = jnp.zeros((3, 17), jnp.bfloat16)
+        for start in range(0, 513, 512):
+            part = xu[:, start:start+512].astype(jnp.float32) @ v[start:start+512].astype(jnp.float32)
+            result = (result.astype(jnp.float32) + part).astype(jnp.bfloat16)
+        return result
+
+    gate, up = project(ug, vg), project(uu, vu)
+    expected = (jax.nn.silu(gate.astype(jnp.float32)).astype(jnp.bfloat16) * up).T
+    assert_close(got, expected, 0.001)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_async_prefetch_matches_sync_after_slot_reuse_and_rank_tail(dtype):
+    # Three rank blocks reuse slot 0 for a partial block. Two input/output
+    # blocks also exercise pipeline drain/restart and both gate/up branches.
+    S, H, R, I = 3, 257, 1025, 513
+    x, uu, vu, ug, vg, ud, vd = random_arrays(
+        [(S,H), (H,R), (R,I), (H,R), (R,I), (I,R), (R,H)], dtype)
+    params = dict(ONE, r_tiles_in_block=2)
+    options = dict(**params, mixed_precision=dtype == jnp.bfloat16, interpret=True)
+    gate_async = t.fused_mlp_up_T(x, ug, vg, uu, vu, **options, async_dma=True)
+    gate_sync = t.fused_mlp_up_T(x, ug, vg, uu, vu, **options, async_dma=False)
+    np.testing.assert_array_equal(np.asarray(gate_async), np.asarray(gate_sync))
+    down_async = t.fused_three_mm_XTUV(gate_async, ud, vd, **options, async_dma=True)
+    down_sync = t.fused_three_mm_XTUV(gate_sync, ud, vd, **options, async_dma=False)
+    np.testing.assert_array_equal(np.asarray(down_async), np.asarray(down_sync))
+    if dtype == jnp.float32:
+        assert_close(down_async, t._unfused_reference(x, uu, vu, ug, vg, ud, vd))
+
+
+def test_async_vmem_budget_includes_second_weight_slot():
+    args = (513, 513, 257, 1025, jnp.float32, 2, 2, 2, 2, True)
+    t._fusion_shape(*args, async_dma=False)
+    with pytest.raises(ValueError, match="VMEM"):
+        t._fusion_shape(*args, async_dma=True)

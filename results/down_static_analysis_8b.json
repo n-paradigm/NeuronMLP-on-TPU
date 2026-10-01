@@ -1,0 +1,92 @@
+{
+  "analysis": {
+    "model": "llama-3.1-8b",
+    "seq_len": 128,
+    "dimensions": {
+      "rows": 128,
+      "input": 14336,
+      "rank": 2560,
+      "output": 4096
+    },
+    "padded_dimensions": {
+      "rows": 128,
+      "input": 14336,
+      "rank": 2560,
+      "output": 4096
+    },
+    "tiles": {
+      "row": 128,
+      "input": 1024,
+      "rank": 512,
+      "output": 1024
+    },
+    "vmem_breakdown_bytes": {
+      "x_block": 3670016,
+      "u_tile": 1048576,
+      "v_tile": 1048576,
+      "xu_accumulator": 655360,
+      "out_tile": 262144,
+      "dot_accumulator_fp32": 524288,
+      "total": 7208960
+    },
+    "vmem_breakdown_mb": {
+      "x_block": 3.5,
+      "u_tile": 1.0,
+      "v_tile": 1.0,
+      "xu_accumulator": 0.625,
+      "out_tile": 0.25,
+      "dot_accumulator_fp32": 0.5,
+      "total": 6.875
+    },
+    "vmem_utilization_percent": 42.96875,
+    "fits_in_budget": true,
+    "dma_analysis": {
+      "input_tiles_per_row": 14,
+      "rank_tiles": 5,
+      "output_tiles_per_row": 4,
+      "u_dma_ops_per_row_strip": 70,
+      "v_dma_ops_per_row_strip": 20,
+      "total_dma_ops_per_row_strip": 90,
+      "row_strips_total": 1,
+      "total_dma_ops": 90
+    },
+    "issues": [
+      {
+        "severity": "HIGH",
+        "issue": "Too many input tiles",
+        "detail": "14 tiles of size 1024 for dimension 14336",
+        "impact": "Each row strip does {u_dma_per_row} U-tile DMAs synchronously"
+      },
+      {
+        "severity": "MEDIUM",
+        "issue": "Input tile undersized",
+        "detail": "Tile 1024 covers only 7.1% of dimension",
+        "impact": "Poor DMA amortization"
+      },
+      {
+        "severity": "HIGH",
+        "issue": "Synchronous DMA strategy",
+        "detail": "pltpu.sync_copy waits for each tile before computation",
+        "impact": "MXU stalls during DMA; no double-buffering"
+      }
+    ]
+  },
+  "suggestions": [
+    {
+      "change": "Increase XUV_INPUT_TILE from 1024 to 2048",
+      "benefit": "Reduces U-tile DMAs from 70 to 35 per row strip",
+      "tradeoff": "Increases U-tile VMEM by 2x; verify VMEM budget"
+    },
+    {
+      "change": "Implement double-buffered async DMA like pallas_dense.py",
+      "benefit": "Overlaps DMA with MXU computation; hides memory latency",
+      "tradeoff": "Adds 2x tile buffer VMEM; more complex kernel code",
+      "reference": "pallas/svdflash_tpu/kernels/pallas_dense.py:60-95"
+    },
+    {
+      "change": "Switch from row-major to output-major tiling",
+      "benefit": "Process all rows for one output tile, may improve V-tile reuse",
+      "tradeoff": "Requires kernel restructure; experimental"
+    }
+  ]
+}

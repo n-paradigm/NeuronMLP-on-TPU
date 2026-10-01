@@ -1,0 +1,61 @@
+{
+  "model": "llama-3.1-8b",
+  "seq_len": 128,
+  "rank": 2560,
+  "assumed_bandwidth_gbps": 819.0,
+  "assumed_tflops": 197.0,
+  "gate_up": {
+    "stage": "gate-up",
+    "blocks": {
+      "bs": 128,
+      "bh": 1024,
+      "br": 512,
+      "bn": 512
+    },
+    "row_strips": 1,
+    "sync_copies_per_row_strip": 320,
+    "weight_bytes": 188743680,
+    "x_bytes": 1048576,
+    "flops": 24159191040,
+    "jax_intermediate_bytes": 14680064,
+    "roofline_us": {
+      "weight_dma": 230.45626373626374,
+      "x_dma": 1.2803125763125762,
+      "mxu": 122.63548751269036,
+      "fusion_credit": 17.92437606837607,
+      "pallas_serial_total": 354.37206382526665,
+      "overlapped_reference_total": 249.66095238095238
+    },
+    "arithmetic_intensity_flop_per_byte": 127.29281767955801,
+    "dma_stall_fraction": 0.6539357922605341,
+    "fusion_pays_for_sync_dma": 0.1461597815764483,
+    "predicted_ratio_vs_overlapped": 1.4194132500325394
+  },
+  "down": {
+    "stage": "down",
+    "blocks": {
+      "bs": 128,
+      "input": 1024,
+      "rank": 512,
+      "output": 1024
+    },
+    "row_strips": 1,
+    "sync_copies_per_row_strip": 90,
+    "weight_bytes": 94371840,
+    "x_bytes": 3670016,
+    "flops": 12079595520,
+    "jax_intermediate_bytes": 1310720,
+    "roofline_us": {
+      "weight_dma": 115.22813186813187,
+      "x_dma": 4.4810940170940174,
+      "mxu": 61.31774375634518,
+      "fusion_credit": 1.6003907203907204,
+      "pallas_serial_total": 181.02696964157107,
+      "overlapped_reference_total": 121.30961660561661
+    },
+    "arithmetic_intensity_flop_per_byte": 123.20855614973262,
+    "dma_stall_fraction": 0.6612784057659873,
+    "fusion_pays_for_sync_dma": 0.026099960995794327,
+    "predicted_ratio_vs_overlapped": 1.4922722097960168
+  }
+}

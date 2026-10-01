@@ -1,0 +1,84 @@
+"""Checks for traffic accounting and device instrumentation of the actual kernels."""
+import json
+import gzip
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from svdflash_tpu import profiler as p
+from svdflash_tpu import test_speedup as k
+
+
+def test_checkpoint_traffic_counts_and_m8():
+    for m in (4, 8):
+        params = p.tile_params(f"{m},2,1,2")
+        gate = p.traffic_model(4096, 2816, 128, 14336, jnp.bfloat16, params, True)
+        down = p.traffic_model(14336, 2816, 128, 4096, jnp.bfloat16, params, False)
+        weights = [r for model in (gate, down) for r in model["transfers"]
+                   if r["tensor"].endswith(("_U", "_V"))]
+        assert sum(r["copy_calls"] for r in weights) == (324 if m == 4 else 258)
+        assert sum(r["total_bytes"] for r in weights) == 297 * 2**20
+        assert gate["hbm_shape"]["rank"] == down["hbm_shape"]["rank"] == 2816
+        assert gate["padded_shape"]["rank"] == 3072
+        assert gate["source_copy_calls"] + down["source_copy_calls"] == (386 if m == 4 else 313)
+
+
+def test_tail_blocks_repeat_weights_per_sequence_block():
+    params = p.tile_params("1,1,1,1")
+    model = p.traffic_model(257, 257, 129, 513, jnp.float32, params, True)
+    assert model["padded_shape"] == dict(M=512, rank=512, S=256, N=1024)
+    assert model["weight_passes"] == 2
+    weights = [r for r in model["transfers"] if r["tensor"].endswith(("_U", "_V"))]
+    assert sum(r["total_bytes"] for r in weights) == 2 * 2 * (512*512 + 512*1024) * 4
+
+
+def test_dry_run_does_not_need_tpu_or_create_files(tmp_path, capsys):
+    report = p.main(["--dry-run", "--trace-root", str(tmp_path / "unused")])
+    assert report["shape"]["rank"] == 2816
+    assert "NOT measured" in report["traffic_source"]
+    assert not (tmp_path / "unused").exists()
+    assert json.loads(capsys.readouterr().out)["profiles"] == {}
+
+
+def test_trace_inventory_excludes_host_dma_labels(tmp_path):
+    events = [
+        {"ph": "M", "pid": 1, "name": "process_name", "args": {"name": "/host:CPU"}},
+        {"ph": "M", "pid": 2, "name": "process_name", "args": {"name": "/device:TPU:0"}},
+        {"ph": "X", "pid": 1, "name": "DMA/wait"},
+        {"ph": "X", "pid": 2, "name": "DMA/wait"},
+        {"ph": "X", "pid": 2, "name": "down/MXU/XUV"},
+        {"ph": "X", "pid": 2, "name": "fused_kernel"},
+    ]
+    with gzip.open(tmp_path / "host.trace.json.gz", "wt", encoding="utf-8") as f:
+        json.dump({"traceEvents": events}, f)
+    result = p.trace_inventory(tmp_path)
+    assert result["device_event_count"] == 3
+    assert result["marker_event_counts"] == {"DMA/wait": 1, "down/MXU/XUV": 1}
+
+
+@pytest.mark.parametrize("async_dma", [False, True])
+def test_instrumentation_preserves_gate_and_down_and_original_module(async_dma):
+    original = k.pltpu.sync_copy
+    scoped = p.instrumented_kernels()
+    rng = np.random.default_rng(71)
+    S, H, R, I = 3, 17, 513, 23
+    def random(shape):
+        return jnp.asarray(rng.normal(size=shape).astype(np.float32) / np.sqrt(shape[0]))
+    x = random((S, H))
+    factors = tuple(random(shape) for shape in ((H,R),(R,I),(H,R),(R,I),(I,R),(R,H)))
+    uu, vu, ug, vg, ud, vd = factors
+    params = p.tile_params("1,1,1,1")
+    options = dict(**params, mixed_precision=False, interpret=True, async_dma=async_dma)
+    base_gate = k.fused_mlp_up_T(x, ug, vg, uu, vu, **options)
+    traced_gate = scoped.fused_mlp_up_T(x, ug, vg, uu, vu, **options)
+    np.testing.assert_array_equal(np.asarray(traced_gate), np.asarray(base_gate))
+    base_down = k.fused_three_mm_XTUV(base_gate, ud, vd, **options)
+    traced_down = scoped.fused_three_mm_XTUV(traced_gate, ud, vd, **options)
+    np.testing.assert_array_equal(np.asarray(traced_down), np.asarray(base_down))
+    assert k.pltpu.sync_copy is original
+
+
+@pytest.mark.parametrize("value", ["8", "1,2,3", "1,2,3,0", "x,2,3,4"])
+def test_invalid_tile_parameters(value):
+    with pytest.raises(Exception, match="four positive|use M"):
+        p.tile_params(value)

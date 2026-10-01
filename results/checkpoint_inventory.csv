@@ -1,0 +1,1 @@
+layer,S,rank,dtype,passed,fused_ms,unfused_low_rank_ms,speedup_vs_unfused,fused_relative_l2,unfused_relative_l2,max_abs_error

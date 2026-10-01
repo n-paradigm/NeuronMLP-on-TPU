@@ -1,0 +1,155 @@
+{
+  "mode": "interpret_correctness_only",
+  "complete": true,
+  "jax": "0.11.1",
+  "checkpoint": {
+    "model_path": "C:\\Users\\zouji\\Desktop\\pallas\\svdflash_tpu\\models\\llama3-8b_0.9_svd",
+    "num_hidden_layers": 32,
+    "hidden_size": 4096,
+    "intermediate_size": 14336,
+    "selected_layers": [
+      0
+    ],
+    "shards": [
+      "model-00001-of-00003.safetensors"
+    ],
+    "layers": [
+      {
+        "layer": 0,
+        "rank": 2816,
+        "dtype": "BF16",
+        "factor_bytes": 311427072,
+        "tensors": [
+          {
+            "key": "model.layers.0.mlp.gate_v_proj.weight",
+            "shape": [
+              2816,
+              4096
+            ],
+            "dtype": "BF16",
+            "shard": "model-00001-of-00003.safetensors"
+          },
+          {
+            "key": "model.layers.0.mlp.gate_u_proj.weight",
+            "shape": [
+              14336,
+              2816
+            ],
+            "dtype": "BF16",
+            "shard": "model-00001-of-00003.safetensors"
+          },
+          {
+            "key": "model.layers.0.mlp.up_v_proj.weight",
+            "shape": [
+              2816,
+              4096
+            ],
+            "dtype": "BF16",
+            "shard": "model-00001-of-00003.safetensors"
+          },
+          {
+            "key": "model.layers.0.mlp.up_u_proj.weight",
+            "shape": [
+              14336,
+              2816
+            ],
+            "dtype": "BF16",
+            "shard": "model-00001-of-00003.safetensors"
+          },
+          {
+            "key": "model.layers.0.mlp.down_v_proj.weight",
+            "shape": [
+              2816,
+              14336
+            ],
+            "dtype": "BF16",
+            "shard": "model-00001-of-00003.safetensors"
+          },
+          {
+            "key": "model.layers.0.mlp.down_u_proj.weight",
+            "shape": [
+              4096,
+              2816
+            ],
+            "dtype": "BF16",
+            "shard": "model-00001-of-00003.safetensors"
+          }
+        ]
+      }
+    ]
+  },
+  "seq_lens": [
+    1
+  ],
+  "input": {
+    "kind": "synthetic_standard_normal",
+    "scale": 1.0,
+    "seed": 0,
+    "shared_across_layers": true,
+    "chain_layers": false
+  },
+  "requested_dtype": "checkpoint",
+  "timing": {
+    "statistic": "median_ms",
+    "warmup": 3,
+    "repeats": 10,
+    "load_and_compile_included": false,
+    "aggregation": "sum_unfused_layer_medians / sum_fused_layer_medians"
+  },
+  "records": [
+    {
+      "layer": 0,
+      "S": 1,
+      "rank": 2816,
+      "dtype": "bfloat16",
+      "up_params": {
+        "M_tiles_in_block": 4,
+        "r_tiles_in_block": 2,
+        "K_tiles_in_block": 1,
+        "N_tiles_in_block": 2
+      },
+      "down_params": {
+        "M_tiles_in_block": 4,
+        "r_tiles_in_block": 2,
+        "K_tiles_in_block": 1,
+        "N_tiles_in_block": 2
+      },
+      "estimated_vmem_bytes": {
+        "gate_up": 7929856,
+        "down": 4194304
+      },
+      "fused_vs_fp32": {
+        "relative_l2": 0.005025908350944519,
+        "max_abs_error": 935376.0,
+        "reference_rms": 7683065.5
+      },
+      "unfused_vs_fp32": {
+        "relative_l2": 0.0029675413388758898,
+        "max_abs_error": 541072.0,
+        "reference_rms": 7683065.5
+      },
+      "fused_vs_unfused": {
+        "relative_l2": 0.005943107418715954,
+        "max_abs_error": 1048576.0,
+        "reference_rms": 7696335.5
+      },
+      "max_relative_l2": 0.12,
+      "passed": true,
+      "compile_and_verify_seconds": 158.27997609999875
+    }
+  ],
+  "summaries": [
+    {
+      "S": 1,
+      "layers_completed": 1,
+      "layers_expected": 1,
+      "complete": true,
+      "passed": true,
+      "failed_layers": [],
+      "max_fused_relative_l2": 0.005025908350944519
+    }
+  ],
+  "devices": [
+    "cpu:0"
+  ]
+}

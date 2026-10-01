@@ -1,0 +1,33 @@
+{
+  "directory": "/home/zouji/svdflash_tpu/optimization_1_4_20260916/20260916T134014Z/profiler_smoke",
+  "files": [
+    "plugins/profile/2026_09_16_13_57_52/perfetto_trace.json.gz",
+    "plugins/profile/2026_09_16_13_57_52/t1v-n-08e78ea1-w-0.trace.json.gz",
+    "plugins/profile/2026_09_16_13_57_52/t1v-n-08e78ea1-w-0.xplane.pb"
+  ],
+  "steps": 1,
+  "inventory": {
+    "checked": true,
+    "device_processes": [
+      "/device:TPU:0"
+    ],
+    "device_event_count": 4084,
+    "marker_event_counts": {
+      "DMA/output/start": 2,
+      "DMA/output/wait": 2,
+      "DMA/start": 2,
+      "DMA/wait": 2,
+      "DMA/weights/start": 17,
+      "DMA/weights/wait": 8,
+      "gate_up/HBM_to_VMEM/U_ref": 4,
+      "gate_up/HBM_to_VMEM/U_ref_1": 4,
+      "gate_up/HBM_to_VMEM/V_ref": 4,
+      "gate_up/HBM_to_VMEM/V_ref_1": 4,
+      "gate_up/HBM_to_VMEM/X_ref": 1,
+      "gate_up/MXU/XU": 4,
+      "gate_up/MXU/XUV": 4,
+      "layout/transpose_X": 2
+    },
+    "note": "Trace event counts, not DMA byte counters; nested/derived tracks may duplicate regions"
+  }
+}

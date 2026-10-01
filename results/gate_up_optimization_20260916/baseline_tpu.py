@@ -1,0 +1,682 @@
+"""NeuronMM/test_speedup.py 的 TPU v5e 对照迁移（JAX >= 0.11.1）。
+
+保留原接口、转置布局、for 循环层级和变量名；range 对应 NKI 的静态循环。
+XU 和 final_result 的块间累加仍按输入 dtype 回写，块内 dot 用 FP32。
+注意：Python range 在 tracing 时展开；大模型首次编译可能较慢。
+运行说明和分块依据见 TEST_SPEEDUP_TPU.md。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import statistics
+import time
+from typing import NamedTuple
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+from jax import lax
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
+
+# TPU v5e MXU 是 128 x 128；这些是软件 tile，不是 NKI 的硬件上限。
+M_TILE = 256
+R_TILE = 256
+K_TILE = 128
+N_TILE = 512
+VMEM_LIMIT = 16 * 1024 * 1024
+VMEM_HEADROOM = 0.8
+
+
+def _round_up(n, tile):
+    return ((n + tile - 1) // tile) * tile
+
+
+def _positive(name, value):
+    if isinstance(value, bool) or not isinstance(value, (int, np.integer)) or value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value}")
+
+
+def _validate_arrays(*arrays):
+    for a in arrays:
+        if a.ndim != 2 or min(a.shape) <= 0:
+            raise ValueError(f"expected a nonempty 2D array, got {a.shape}")
+        if a.dtype != arrays[0].dtype:
+            raise TypeError("all inputs must have the same dtype")
+    if arrays[0].dtype not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)):
+        raise TypeError("supported dtypes are bfloat16 and float32")
+
+
+def _pad(a, rows, cols):
+    return jnp.pad(a, ((0, rows - a.shape[0]), (0, cols - a.shape[1])))
+
+
+def _mesh(interpret):
+    if interpret:
+        return (pltpu.TensorCoreMesh(axis_name="core", num_cores=1),
+                pltpu.InterpretParams(num_cores_or_threads=1))
+    return pltpu.TensorCoreMesh(axis_name="core"), False
+
+
+def _dot(stationary, moving, mixed_precision):
+    # 对应 nisa.nc_matmul(stationary, moving) = stationary.T @ moving。
+    dtype = jnp.bfloat16 if mixed_precision else jnp.float32
+    return jnp.dot(stationary.astype(dtype).T, moving.astype(dtype),
+                   preferred_element_type=jnp.float32,
+                   precision=None if mixed_precision else lax.Precision.HIGHEST)
+
+
+def _vmem_type(mesh, interpret, shape, dtype):
+    # JAX 0.11.1 CPU interpreter recognizes VMEM, but not mesh-bound VMEM@TC.
+    memory = pltpu.VMEM if interpret else pltpu.VMEM @ mesh
+    return memory(shape, dtype)
+
+
+def _tile(ref, row, col, rows, cols):
+    return ref.at[pl.dslice(row, rows), pl.dslice(col, cols)]
+
+
+def _check_load(input_ref, vmem_ref, ofs, load_shape, transpose=False):
+    if len(ofs) != 2 or len(load_shape) != 3:
+        raise ValueError("ofs must be (row, col); load_shape must be (block, par, free)")
+    block_size, par_size, free_size = load_shape
+    for name, value in zip(("block_size", "par_size", "free_size"), load_shape):
+        _positive(name, value)
+    if tuple(vmem_ref.shape) != (block_size * par_size, free_size):
+        raise ValueError("vmem_ref must have shape (block_size * par_size, free_size)")
+    if len(input_ref.shape) != 2:
+        raise ValueError("input_ref must be 2D")
+    # DMA 不使用 NKI 的 mask；launcher 先补零。静态偏移可在 tracing 时检查。
+    extent = (free_size, block_size * par_size) if transpose else (
+        block_size * par_size, free_size)
+    for offset, size, bound in zip(ofs, extent, input_ref.shape):
+        if isinstance(offset, (int, np.integer)) and (offset < 0 or offset + size > bound):
+            raise ValueError("load exceeds input bounds; pad the input before launching")
+
+
+def load_tensor_block(input_ref, vmem_ref, ofs: tuple[int, int],
+                      load_shape: tuple[int, int, int]):
+    """HBM -> VMEM；原 (par, block, free) 缓存改为 (block * par, free)。"""
+    _check_load(input_ref, vmem_ref, ofs, load_shape)
+    block_size, par_size, free_size = load_shape
+    row_offset, column_offset = ofs
+    for block_id in range(block_size):
+        pltpu.sync_copy(
+            _tile(input_ref, row_offset + block_id * par_size, column_offset,
+                  par_size, free_size),
+            _tile(vmem_ref, block_id * par_size, 0, par_size, free_size))
+    return pltpu.load(vmem_ref)
+
+
+def load_tensor_block_T(input_ref, vmem_ref, ofs: tuple[int, int],
+                        load_shape: tuple[int, int, int], *, staging_ref):
+    """HBM -> staging -> 转置 VMEM；staging_ref 形状是 (free_size, par_size)。"""
+    _check_load(input_ref, vmem_ref, ofs, load_shape, transpose=True)
+    block_size, par_size, free_size = load_shape
+    if tuple(staging_ref.shape) != (free_size, par_size):
+        raise ValueError("staging_ref must have shape (free_size, par_size)")
+    row_offset, column_offset = ofs
+    for block_id in range(block_size):
+        pltpu.sync_copy(
+            _tile(input_ref, row_offset, column_offset + block_id * par_size,
+                  free_size, par_size), staging_ref)
+        pltpu.store(_tile(vmem_ref, block_id * par_size, 0, par_size, free_size),
+                    pltpu.load(staging_ref).T)
+    return pltpu.load(vmem_ref)
+
+
+def get_fused_mlp_up_T_params(S):
+    """v5e 的保守起点，非实测最优。默认块 (M,r,K,N)=(1024,512,128/256,1024)。"""
+    _positive("S", S)
+    return dict(M_tiles_in_block=8, r_tiles_in_block=2,
+                K_tiles_in_block=1 if S < 512 else 2, N_tiles_in_block=2)
+
+
+def get_fused_three_mm_XTUV_params(S):
+    _positive("S", S)
+    return dict(M_tiles_in_block=4, r_tiles_in_block=2,
+                K_tiles_in_block=1 if S < 512 else 2, N_tiles_in_block=2)
+
+
+class _FusionShape(NamedTuple):
+    M_block: int
+    r_block: int
+    K_block: int
+    N_block: int
+    M_padded: int
+    r_padded: int
+    K_padded: int
+    N_padded: int
+    vmem_bytes: int
+
+
+def _fusion_shape(M, r, K, N, dtype, M_count, r_count, K_count, N_count, gate):
+    for name, value in zip(("M_tiles_in_block", "r_tiles_in_block",
+                            "K_tiles_in_block", "N_tiles_in_block"),
+                           (M_count, r_count, K_count, N_count)):
+        _positive(name, value)
+    mb, rb, kb, nb = M_TILE*M_count, R_TILE*r_count, K_TILE*K_count, N_TILE*N_count
+    mp, rp, kp, npad = (_round_up(M, mb), _round_up(r, rb),
+                        _round_up(K, kb), _round_up(N, nb))
+    size = jnp.dtype(dtype).itemsize
+    branches = 2 if gate else 1
+    # 所有显式 scratch，加两组 FP32 dot 临时量；编译器还可能增加布局副本。
+    elements = mb*kb + branches*(mb*rb + rb*nb + rp*kb + nb*kb) + nb*kb
+    if gate:
+        elements += kb*M_TILE
+    estimate = elements*size + branches*max(R_TILE*K_TILE, N_TILE*K_TILE)*8
+    _check_vmem(estimate)
+    return _FusionShape(mb, rb, kb, nb, mp, rp, kp, npad, estimate)
+
+
+def _check_vmem(estimate):
+    if estimate >= VMEM_LIMIT * VMEM_HEADROOM:
+        raise ValueError(f"estimated VMEM {estimate/2**20:.2f} MiB exceeds "
+                         "12.8 MiB budget; reduce *_tiles_in_block")
+
+
+
+def fused_three_mm_XTUV(
+    X_ref, U_ref, V_ref,
+    mixed_precision=True, r_tiles_in_block=2, K_tiles_in_block=1,
+    N_tiles_in_block=2, M_tiles_in_block=4, *, interpret=False,
+):
+    """X_ref=(M,K), U_ref=(M,r), V_ref=(r,N)，返回 X_ref.T @ U_ref @ V_ref。"""
+    _validate_arrays(X_ref, U_ref, V_ref)
+    M, K = X_ref.shape
+    if U_ref.shape[0] != M or V_ref.shape[0] != U_ref.shape[1]:
+        raise ValueError("X, U, V contraction dimensions do not match")
+    r, N = V_ref.shape
+    shape = _fusion_shape(M, r, K, N, X_ref.dtype, M_tiles_in_block,
+                          r_tiles_in_block, K_tiles_in_block, N_tiles_in_block,
+                          gate=False)
+    M_block_size, r_block_size, K_block_size, N_block_size = shape[:4]
+    Mp, rp, Kp, Np = shape[4:8]
+    M_tile_size, r_tile_size, K_tile_size, N_tile_size = M_TILE, R_TILE, K_TILE, N_TILE
+    M_n_blocks, r_n_blocks = Mp // M_block_size, rp // r_block_size
+    K_n_blocks, N_n_blocks = Kp // K_block_size, Np // N_block_size
+    mesh, interpretation = _mesh(interpret)
+    kernel_dtype = X_ref.dtype
+    def vmem(rows, cols):
+        return _vmem_type(mesh, interpret, (rows, cols), kernel_dtype)
+
+    @pl.kernel(
+        mesh=mesh, interpret=interpretation,
+        out_type=jax.ShapeDtypeStruct((Kp, Np), kernel_dtype),
+        scratch_types=(
+            vmem(M_block_size, K_block_size),
+            vmem(M_block_size, r_block_size),
+            vmem(r_block_size, N_block_size),
+            vmem(rp, K_block_size),
+            vmem(K_block_size, N_block_size),
+            vmem(K_tile_size, N_block_size),
+        ), name="fused_three_mm_XTUV_v5e",
+    )
+    def kernel(X_ref, U_ref, V_ref, out_ref,
+               X_cache_ref, U_cache_ref,
+               V_cache_ref,
+               XU_result_buf,
+               final_result_buf, output_tile_ref):
+        # nl.affine_range / nl.sequential_range -> Python range，层级和顺序保留。
+        # v5e 每芯片一个 TensorCore；更大 mesh 按 K 块分工。
+        for i_K_block in range(K_n_blocks):
+            @pl.when(lax.axis_index("core") == i_K_block % mesh.num_cores)
+            def process_K_block():
+                pltpu.store(XU_result_buf, jnp.zeros(XU_result_buf.shape, kernel_dtype))
+                for i_M_block in range(M_n_blocks):
+                    load_tensor_block(
+                        X_ref, X_cache_ref,
+                        (i_M_block * M_block_size, i_K_block * K_block_size),
+                        (M_tiles_in_block, M_tile_size, K_block_size))
+                    for i_r_block in range(r_n_blocks):
+                        load_tensor_block(
+                            U_ref, U_cache_ref,
+                            (i_M_block * M_block_size, i_r_block * r_block_size),
+                            (M_tiles_in_block, M_tile_size, r_block_size))
+                        for ib_K_tile in range(K_tiles_in_block):
+                            for ib_r_tile in range(r_tiles_in_block):
+                                XU_psum = jnp.zeros((r_tile_size, K_tile_size), jnp.float32)
+                                for ib_M_tile in range(M_tiles_in_block):
+                                    X_tile = pltpu.load(_tile(
+                                        X_cache_ref, ib_M_tile*M_tile_size,
+                                        ib_K_tile*K_tile_size, M_tile_size, K_tile_size))
+                                    U_tile = pltpu.load(_tile(
+                                        U_cache_ref, ib_M_tile*M_tile_size,
+                                        ib_r_tile*r_tile_size, M_tile_size, r_tile_size))
+                                    XU_psum += _dot(U_tile, X_tile, mixed_precision)
+                                xu_tile_ref = _tile(
+                                    XU_result_buf, i_r_block*r_block_size + ib_r_tile*r_tile_size,
+                                    ib_K_tile*K_tile_size, r_tile_size, K_tile_size)
+                                pltpu.store(xu_tile_ref,
+                                    (pltpu.load(xu_tile_ref).astype(jnp.float32) + XU_psum).astype(kernel_dtype))
+
+                for i_N_block in range(N_n_blocks):
+                    pltpu.store(final_result_buf, jnp.zeros(final_result_buf.shape, kernel_dtype))
+                    for i_r_block in range(r_n_blocks):
+                        load_tensor_block(
+                            V_ref, V_cache_ref,
+                            (i_r_block*r_block_size, i_N_block*N_block_size),
+                            (r_tiles_in_block, r_tile_size, N_block_size))
+                        for ib_K_tile in range(K_tiles_in_block):
+                            for ib_N_tile in range(N_tiles_in_block):
+                                XUV_psum = jnp.zeros((K_tile_size, N_tile_size), jnp.float32)
+                                for ib_r_tile in range(r_tiles_in_block):
+                                    XU_tile = pltpu.load(_tile(
+                                        XU_result_buf, i_r_block*r_block_size + ib_r_tile*r_tile_size,
+                                        ib_K_tile*K_tile_size, r_tile_size, K_tile_size))
+                                    V_tile = pltpu.load(_tile(
+                                        V_cache_ref, ib_r_tile*r_tile_size,
+                                        ib_N_tile*N_tile_size, r_tile_size, N_tile_size))
+                                    XUV_psum += _dot(XU_tile, V_tile, mixed_precision)
+                                final_tile_ref = _tile(
+                                    final_result_buf, ib_K_tile*K_tile_size, ib_N_tile*N_tile_size,
+                                    K_tile_size, N_tile_size)
+                                pltpu.store(final_tile_ref,
+                                    (pltpu.load(final_tile_ref).astype(jnp.float32) + XUV_psum).astype(kernel_dtype))
+                    for ib_K_tile in range(K_tiles_in_block):
+                        pltpu.store(output_tile_ref, pltpu.load(_tile(
+                            final_result_buf, ib_K_tile*K_tile_size, 0, K_tile_size, N_block_size)))
+                        pltpu.sync_copy(output_tile_ref, _tile(
+                            out_ref, i_K_block*K_block_size + ib_K_tile*K_tile_size,
+                            i_N_block*N_block_size, K_tile_size, N_block_size))
+    output = kernel(
+        _pad(X_ref, Mp, Kp), _pad(U_ref, Mp, rp), _pad(V_ref, rp, Np))
+    return output[:K, :N]
+
+
+def fused_mlp_up_T(
+    X_ref, U_ref, V_ref, U_ref_1, V_ref_1,
+    mixed_precision=True, r_tiles_in_block=2, K_tiles_in_block=1,
+    N_tiles_in_block=2, M_tiles_in_block=4, *, interpret=False,
+):
+    """返回 (N,K) 的 SiLU(X U V) * (X U_1 V_1) 转置。"""
+    _validate_arrays(X_ref, U_ref, V_ref, U_ref_1, V_ref_1)
+    K, M = X_ref.shape
+    if U_ref.shape[0] != M or V_ref.shape[0] != U_ref.shape[1]:
+        raise ValueError("X, U, V contraction dimensions do not match")
+    if U_ref_1.shape != U_ref.shape or V_ref_1.shape != V_ref.shape:
+        raise ValueError("gate/up factors must have matching shapes")
+    r, N = V_ref.shape
+    shape = _fusion_shape(M, r, K, N, X_ref.dtype, M_tiles_in_block,
+                          r_tiles_in_block, K_tiles_in_block, N_tiles_in_block,
+                          gate=True)
+    M_block_size, r_block_size, K_block_size, N_block_size = shape[:4]
+    Mp, rp, Kp, Np = shape[4:8]
+    M_tile_size, r_tile_size, K_tile_size, N_tile_size = M_TILE, R_TILE, K_TILE, N_TILE
+    M_n_blocks, r_n_blocks = Mp // M_block_size, rp // r_block_size
+    K_n_blocks, N_n_blocks = Kp // K_block_size, Np // N_block_size
+    mesh, interpretation = _mesh(interpret)
+    kernel_dtype = X_ref.dtype
+    def vmem(rows, cols):
+        return _vmem_type(mesh, interpret, (rows, cols), kernel_dtype)
+
+    @pl.kernel(
+        mesh=mesh, interpret=interpretation,
+        out_type=jax.ShapeDtypeStruct((Np, Kp), kernel_dtype),
+        scratch_types=(
+            vmem(M_block_size, K_block_size),
+            vmem(M_block_size, r_block_size),
+            vmem(M_block_size, r_block_size),
+            vmem(r_block_size, N_block_size),
+            vmem(r_block_size, N_block_size),
+            vmem(rp, K_block_size),
+            vmem(rp, K_block_size),
+            vmem(N_block_size, K_block_size),
+            vmem(N_block_size, K_block_size),
+            vmem(K_block_size, M_tile_size),
+            vmem(N_tile_size, K_block_size),
+        ), name="fused_mlp_up_T_v5e",
+    )
+    def kernel(X_ref, U_ref, V_ref, U_ref_1, V_ref_1, out_ref,
+               X_cache_ref, U_cache_ref, U_cache_ref_1,
+               V_cache_ref, V_cache_ref_1,
+               XU_result_buf, XU_result_buf_1,
+               final_result_buf, final_result_buf_1, staging_ref, output_tile_ref):
+        # nl.affine_range / nl.sequential_range -> Python range，层级和顺序保留。
+        # v5e 每芯片一个 TensorCore；更大 mesh 按 K 块分工。
+        for i_K_block in range(K_n_blocks):
+            @pl.when(lax.axis_index("core") == i_K_block % mesh.num_cores)
+            def process_K_block():
+                pltpu.store(XU_result_buf, jnp.zeros(XU_result_buf.shape, kernel_dtype))
+                pltpu.store(XU_result_buf_1, jnp.zeros(XU_result_buf_1.shape, kernel_dtype))
+                for i_M_block in range(M_n_blocks):
+                    load_tensor_block_T(
+                        X_ref, X_cache_ref,
+                        (i_K_block * K_block_size, i_M_block * M_block_size),
+                        (M_tiles_in_block, M_tile_size, K_block_size),
+                        staging_ref=staging_ref)
+                    for i_r_block in range(r_n_blocks):
+                        load_tensor_block(
+                            U_ref, U_cache_ref,
+                            (i_M_block * M_block_size, i_r_block * r_block_size),
+                            (M_tiles_in_block, M_tile_size, r_block_size))
+                        load_tensor_block(
+                            U_ref_1, U_cache_ref_1,
+                            (i_M_block * M_block_size, i_r_block * r_block_size),
+                            (M_tiles_in_block, M_tile_size, r_block_size))
+                        for ib_K_tile in range(K_tiles_in_block):
+                            for ib_r_tile in range(r_tiles_in_block):
+                                XU_psum = jnp.zeros((r_tile_size, K_tile_size), jnp.float32)
+                                XU_psum_1 = jnp.zeros_like(XU_psum)
+                                for ib_M_tile in range(M_tiles_in_block):
+                                    X_tile = pltpu.load(_tile(
+                                        X_cache_ref, ib_M_tile*M_tile_size,
+                                        ib_K_tile*K_tile_size, M_tile_size, K_tile_size))
+                                    U_tile = pltpu.load(_tile(
+                                        U_cache_ref, ib_M_tile*M_tile_size,
+                                        ib_r_tile*r_tile_size, M_tile_size, r_tile_size))
+                                    XU_psum += _dot(U_tile, X_tile, mixed_precision)
+                                    U_tile_1 = pltpu.load(_tile(
+                                        U_cache_ref_1, ib_M_tile*M_tile_size,
+                                        ib_r_tile*r_tile_size, M_tile_size, r_tile_size))
+                                    XU_psum_1 += _dot(U_tile_1, X_tile, mixed_precision)
+                                xu_tile_ref = _tile(
+                                    XU_result_buf, i_r_block*r_block_size + ib_r_tile*r_tile_size,
+                                    ib_K_tile*K_tile_size, r_tile_size, K_tile_size)
+                                pltpu.store(xu_tile_ref,
+                                    (pltpu.load(xu_tile_ref).astype(jnp.float32) + XU_psum).astype(kernel_dtype))
+                                xu_tile_ref_1 = _tile(
+                                    XU_result_buf_1, i_r_block*r_block_size + ib_r_tile*r_tile_size,
+                                    ib_K_tile*K_tile_size, r_tile_size, K_tile_size)
+                                pltpu.store(xu_tile_ref_1,
+                                    (pltpu.load(xu_tile_ref_1).astype(jnp.float32) + XU_psum_1).astype(kernel_dtype))
+
+                for i_N_block in range(N_n_blocks):
+                    pltpu.store(final_result_buf, jnp.zeros(final_result_buf.shape, kernel_dtype))
+                    pltpu.store(final_result_buf_1, jnp.zeros(final_result_buf_1.shape, kernel_dtype))
+                    for i_r_block in range(r_n_blocks):
+                        load_tensor_block(
+                            V_ref, V_cache_ref,
+                            (i_r_block*r_block_size, i_N_block*N_block_size),
+                            (r_tiles_in_block, r_tile_size, N_block_size))
+                        load_tensor_block(
+                            V_ref_1, V_cache_ref_1,
+                            (i_r_block*r_block_size, i_N_block*N_block_size),
+                            (r_tiles_in_block, r_tile_size, N_block_size))
+                        for ib_K_tile in range(K_tiles_in_block):
+                            for ib_N_tile in range(N_tiles_in_block):
+                                XUV_psum = jnp.zeros((N_tile_size, K_tile_size), jnp.float32)
+                                XUV_psum_1 = jnp.zeros_like(XUV_psum)
+                                for ib_r_tile in range(r_tiles_in_block):
+                                    XU_tile = pltpu.load(_tile(
+                                        XU_result_buf, i_r_block*r_block_size + ib_r_tile*r_tile_size,
+                                        ib_K_tile*K_tile_size, r_tile_size, K_tile_size))
+                                    V_tile = pltpu.load(_tile(
+                                        V_cache_ref, ib_r_tile*r_tile_size,
+                                        ib_N_tile*N_tile_size, r_tile_size, N_tile_size))
+                                    XUV_psum += _dot(V_tile, XU_tile, mixed_precision)
+                                    XU_tile_1 = pltpu.load(_tile(
+                                        XU_result_buf_1, i_r_block*r_block_size + ib_r_tile*r_tile_size,
+                                        ib_K_tile*K_tile_size, r_tile_size, K_tile_size))
+                                    V_tile_1 = pltpu.load(_tile(
+                                        V_cache_ref_1, ib_r_tile*r_tile_size,
+                                        ib_N_tile*N_tile_size, r_tile_size, N_tile_size))
+                                    XUV_psum_1 += _dot(V_tile_1, XU_tile_1, mixed_precision)
+                                final_tile_ref = _tile(
+                                    final_result_buf, ib_N_tile*N_tile_size, ib_K_tile*K_tile_size,
+                                    N_tile_size, K_tile_size)
+                                pltpu.store(final_tile_ref,
+                                    (pltpu.load(final_tile_ref).astype(jnp.float32) + XUV_psum).astype(kernel_dtype))
+                                final_tile_ref_1 = _tile(
+                                    final_result_buf_1, ib_N_tile*N_tile_size, ib_K_tile*K_tile_size,
+                                    N_tile_size, K_tile_size)
+                                pltpu.store(final_tile_ref_1,
+                                    (pltpu.load(final_tile_ref_1).astype(jnp.float32) + XUV_psum_1).astype(kernel_dtype))
+                    for ib_N_tile in range(N_tiles_in_block):
+                        gate = pltpu.load(_tile(
+                            final_result_buf, ib_N_tile*N_tile_size, 0, N_tile_size, K_block_size))
+                        up = pltpu.load(_tile(
+                            final_result_buf_1, ib_N_tile*N_tile_size, 0, N_tile_size, K_block_size))
+                        # SiLU 用 FP32 计算，回写 kernel_dtype。
+                        activated = jax.nn.silu(gate.astype(jnp.float32)).astype(kernel_dtype)
+                        pltpu.store(output_tile_ref, (activated * up).astype(kernel_dtype))
+                        pltpu.sync_copy(output_tile_ref, _tile(
+                            out_ref, i_N_block*N_block_size + ib_N_tile*N_tile_size,
+                            i_K_block*K_block_size, N_tile_size, K_block_size))
+    output = kernel(
+        _pad(X_ref, Kp, Mp), _pad(U_ref, Mp, rp), _pad(V_ref, rp, Np),
+        _pad(U_ref_1, Mp, rp), _pad(V_ref_1, rp, Np))
+    return output[:N, :K]
+
+
+def nki_matmul_fully_optimized_(
+    lhsT, rhs, TILES_IN_BLOCK_M=2, TILES_IN_BLOCK_N=2, TILES_IN_BLOCK_K=4,
+    *, mixed_precision=True, interpret=False,
+):
+    """保留 NKI 名称/布局：lhsT=(K,M), rhs=(K,N)，返回 (M,N)。"""
+    _validate_arrays(lhsT, rhs)
+    K, M = lhsT.shape
+    if rhs.shape[0] != K:
+        raise ValueError("lhsT and rhs must have the same contraction dimension")
+    N = rhs.shape[1]
+    for name, value in zip(("TILES_IN_BLOCK_M", "TILES_IN_BLOCK_N", "TILES_IN_BLOCK_K"),
+                           (TILES_IN_BLOCK_M, TILES_IN_BLOCK_N, TILES_IN_BLOCK_K)):
+        _positive(name, value)
+    TILE_M, TILE_K, TILE_N = K_TILE, M_TILE, N_TILE
+    BLOCK_M, BLOCK_K, BLOCK_N = (TILE_M*TILES_IN_BLOCK_M,
+                                TILE_K*TILES_IN_BLOCK_K, TILE_N*TILES_IN_BLOCK_N)
+    Mp, Kp, Np = _round_up(M, BLOCK_M), _round_up(K, BLOCK_K), _round_up(N, BLOCK_N)
+    NUM_BLOCK_M, NUM_BLOCK_K, NUM_BLOCK_N = Mp//BLOCK_M, Kp//BLOCK_K, Np//BLOCK_N
+    estimate = ((Mp*BLOCK_N + BLOCK_K*BLOCK_N + BLOCK_K*BLOCK_M + TILE_M*BLOCK_N)
+                * lhsT.dtype.itemsize + TILE_M*TILE_N*8)
+    _check_vmem(estimate)
+    mesh, interpretation = _mesh(interpret)
+    def vmem(rows, cols):
+        return _vmem_type(mesh, interpret, (rows, cols), lhsT.dtype)
+
+    @pl.kernel(
+        mesh=mesh, interpret=interpretation,
+        out_type=jax.ShapeDtypeStruct((Mp, Np), lhsT.dtype),
+        scratch_types=(vmem(Mp, BLOCK_N), vmem(BLOCK_K, BLOCK_N),
+                       vmem(BLOCK_K, BLOCK_M), vmem(TILE_M, BLOCK_N)),
+        name="nki_matmul_fully_optimized_v5e",
+    )
+    def kernel(lhsT, rhs, result, result_tiles, rhs_tiles, lhsT_tiles, result_packed):
+        # 与原代码一致：n -> k -> m -> bn -> bm -> bk。
+        for n in range(NUM_BLOCK_N):
+            @pl.when(lax.axis_index("core") == n % mesh.num_cores)
+            def process_N_block():
+                pltpu.store(result_tiles, jnp.zeros(result_tiles.shape, result_tiles.dtype))
+                for k in range(NUM_BLOCK_K):
+                    for bk_r in range(TILES_IN_BLOCK_K):
+                        k_index = (k*TILES_IN_BLOCK_K + bk_r)*TILE_K
+                        pltpu.sync_copy(_tile(rhs, k_index, BLOCK_N*n, TILE_K, BLOCK_N),
+                                        _tile(rhs_tiles, bk_r*TILE_K, 0, TILE_K, BLOCK_N))
+                    for m in range(NUM_BLOCK_M):
+                        for bk_l in range(TILES_IN_BLOCK_K):
+                            k_index = (k*TILES_IN_BLOCK_K + bk_l)*TILE_K
+                            pltpu.sync_copy(_tile(lhsT, k_index, BLOCK_M*m, TILE_K, BLOCK_M),
+                                            _tile(lhsT_tiles, bk_l*TILE_K, 0, TILE_K, BLOCK_M))
+                        for bn in range(TILES_IN_BLOCK_N):
+                            for bm in range(TILES_IN_BLOCK_M):
+                                res_tile = jnp.zeros((TILE_M, TILE_N), jnp.float32)
+                                for bk in range(TILES_IN_BLOCK_K):
+                                    a = pltpu.load(_tile(lhsT_tiles, bk*TILE_K, bm*TILE_M, TILE_K, TILE_M))
+                                    b = pltpu.load(_tile(rhs_tiles, bk*TILE_K, bn*TILE_N, TILE_K, TILE_N))
+                                    res_tile += _dot(a, b, mixed_precision)
+                                result_tile_ref = _tile(result_tiles, m*BLOCK_M + bm*TILE_M,
+                                                        bn*TILE_N, TILE_M, TILE_N)
+                                pltpu.store(result_tile_ref,
+                                    (pltpu.load(result_tile_ref).astype(jnp.float32) + res_tile).astype(result_tiles.dtype))
+                for m in range(NUM_BLOCK_M):
+                    for bm in range(TILES_IN_BLOCK_M):
+                        for bn in range(TILES_IN_BLOCK_N):
+                            pltpu.store(_tile(result_packed, 0, bn*TILE_N, TILE_M, TILE_N),
+                                pltpu.load(_tile(result_tiles, m*BLOCK_M + bm*TILE_M,
+                                                 bn*TILE_N, TILE_M, TILE_N)))
+                        pltpu.sync_copy(result_packed, _tile(
+                            result, m*BLOCK_M + bm*TILE_M, BLOCK_N*n, TILE_M, BLOCK_N))
+    return kernel(_pad(lhsT, Kp, Mp), _pad(rhs, Kp, Np))[:M, :N]
+
+
+def svd_mlp_with_fused_kernel(x, u_up, v_up, u_gate, v_gate, u_down, v_down,
+                             up_T_params=None, XTUV_params=None, *,
+                             mixed_precision=True, interpret=False):
+    S = x.shape[0]
+    if up_T_params is None:
+        up_T_params = get_fused_mlp_up_T_params(S)
+    if XTUV_params is None:
+        XTUV_params = get_fused_three_mm_XTUV_params(S)
+    activated_gate_t = fused_mlp_up_T(
+        x, u_gate, v_gate, u_up, v_up, **up_T_params,
+        mixed_precision=mixed_precision, interpret=interpret)
+    return fused_three_mm_XTUV(
+        activated_gate_t, u_down, v_down, **XTUV_params,
+        mixed_precision=mixed_precision, interpret=interpret)
+
+
+def nki_mm(x, up_v_proj, up_u_proj, gate_v_proj, gate_u_proj,
+           down_v_proj, down_u_proj, *, mixed_precision=True, interpret=False,
+           up_T_params=None, XTUV_params=None):
+    # 与 torch.nn.Linear 的权重布局一致；内部使用 JAX 数组的 .T。
+    return svd_mlp_with_fused_kernel(
+        x, up_v_proj.T, up_u_proj.T, gate_v_proj.T, gate_u_proj.T,
+        down_v_proj.T, down_u_proj.T, up_T_params, XTUV_params,
+        mixed_precision=mixed_precision, interpret=interpret)
+
+
+def nki_baseline(x, up_proj, gate_proj, down_proj, *,
+                 mixed_precision=True, interpret=False, matmul_params=None):
+    params = {} if matmul_params is None else matmul_params
+    up = nki_matmul_fully_optimized_(x.T, up_proj.T, **params,
+                                   mixed_precision=mixed_precision, interpret=interpret)
+    gate = nki_matmul_fully_optimized_(x.T, gate_proj.T, **params,
+                                     mixed_precision=mixed_precision, interpret=interpret)
+    act = jax.nn.silu(gate.astype(jnp.float32)).astype(x.dtype) * up
+    return nki_matmul_fully_optimized_(act.T, down_proj.T, **params,
+                                      mixed_precision=mixed_precision, interpret=interpret)
+
+
+def _unfused_reference(x, u_up, v_up, u_gate, v_gate, u_down, v_down):
+    # FP32 golden reference；和 kernel 使用相同的 SVD 因子。
+    x, u_up, v_up, u_gate, v_gate, u_down, v_down = [
+        a.astype(jnp.float32) for a in (x, u_up, v_up, u_gate, v_gate, u_down, v_down)]
+    gate = (x @ u_gate) @ v_gate
+    up = (x @ u_up) @ v_up
+    return ((jax.nn.silu(gate) * up) @ u_down) @ v_down
+
+
+def _unfused_low_rank(x, u_up, v_up, u_gate, v_gate, u_down, v_down):
+    # BF16 benchmark 对照：与融合实现同精度、同因子、同布局。
+    gate = (x @ u_gate) @ v_gate
+    up = (x @ u_up) @ v_up
+    hidden = jax.nn.silu(gate.astype(jnp.float32)).astype(x.dtype) * up
+    return (hidden @ u_down) @ v_down
+
+
+def _time_ms(fn, args, warmup, repeats):
+    # 编译和预热不计入；每次都等待 TPU 执行完成。
+    jax.block_until_ready(fn(*args))
+    for _ in range(warmup):
+        jax.block_until_ready(fn(*args))
+    samples = []
+    for _ in range(repeats):
+        start = time.perf_counter()
+        jax.block_until_ready(fn(*args))
+        samples.append((time.perf_counter() - start) * 1000)
+    return statistics.median(samples)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-path", help="offline SVD checkpoint directory; test real layers")
+    parser.add_argument("--layers", type=int, nargs="+", help="layer indices; defaults to all checkpoint layers")
+    parser.add_argument("--output", help="real-layer JSON report path; also writes a sibling CSV")
+    parser.add_argument("--inspect-only", action="store_true", help="validate real checkpoint headers without loading tensors")
+    parser.add_argument("--input-scale", type=float, default=1.0)
+    parser.add_argument("--max-relative-l2", type=float)
+    parser.add_argument("--model", choices=("llama3-3b", "llama3-8b"), default="llama3-3b")
+    parser.add_argument("--seq-lens", type=int, nargs="+", default=[1, 128, 512])
+    parser.add_argument("--hidden", type=int)
+    parser.add_argument("--intermediate", type=int)
+    parser.add_argument("--rank", type=int)
+    parser.add_argument("--dtype", choices=("bf16", "fp32"), help="defaults to checkpoint dtype, or bf16 for synthetic tests")
+    parser.add_argument("--warmup", type=int, default=3)
+    parser.add_argument("--repeats", type=int, default=10)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--interpret", action="store_true", help="CPU 数值验证，不报告 TPU speedup")
+    parser.add_argument("--check-only", action="store_true")
+    args = parser.parse_args(argv)
+    if args.warmup < 0 or args.repeats <= 0:
+        parser.error("warmup must be >= 0 and repeats must be > 0")
+    for s in args.seq_lens:
+        _positive("sequence length", s)
+    if args.model_path:
+        if any(v is not None for v in (args.hidden, args.intermediate, args.rank)):
+            parser.error("real-checkpoint dimensions come from the tensors; omit --hidden/--intermediate/--rank")
+        import sys
+        from pathlib import Path
+        if not __package__:
+            sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        from svdflash_tpu.bench.checkpoint_speedup import run
+        return run(args, sys.modules[__name__])
+    if args.layers is not None or args.inspect_only or args.output or args.max_relative_l2 is not None:
+        parser.error("--layers/--inspect-only/--output/--max-relative-l2 require --model-path")
+    args.dtype = args.dtype or "bf16"
+    base = (3072, 8192, 1792) if args.model == "llama3-3b" else (4096, 14336, 2560)
+    if args.interpret:
+        base = (129, 137, 131)
+    H, I, R = tuple(value if value is not None else default
+                    for value, default in zip((args.hidden, args.intermediate, args.rank), base))
+    for name, value in zip(("hidden", "intermediate", "rank"), (H, I, R)):
+        _positive(name, value)
+    if not args.interpret and jax.default_backend() != "tpu":
+        parser.error("TPU backend required for benchmarking; use --interpret for CPU checks")
+    dtype = jnp.bfloat16 if args.dtype == "bf16" else jnp.float32
+    mixed = args.dtype == "bf16"
+    rng = np.random.default_rng(args.seed)
+    def random_matrix(rows, cols):
+        return jnp.asarray(rng.normal(size=(rows, cols)).astype(np.float32) / math.sqrt(rows), dtype=dtype)
+    factors = (random_matrix(H, R), random_matrix(R, I),
+               random_matrix(H, R), random_matrix(R, I),
+               random_matrix(I, R), random_matrix(R, H))
+    # Dense 权重由相同因子重建；重建成本在计时之外。
+    uu, vu, ug, vg, ud, vd = factors
+    weights = tuple((u.astype(jnp.float32) @ v.astype(jnp.float32)).astype(dtype).T
+                    for u, v in ((uu, vu), (ug, vg), (ud, vd)))
+    print(json.dumps({"jax": jax.__version__, "devices": [str(d) for d in jax.devices()],
+                      "mode": "interpret_correctness_only" if args.interpret else "tpu",
+                      "shape": {"H": H, "I": I, "R": R}, "dtype": args.dtype}))
+    for S in args.seq_lens:
+        x = jnp.asarray(rng.normal(size=(S, H)).astype(np.float32), dtype=dtype)
+        up_params = get_fused_mlp_up_T_params(S)
+        down_params = get_fused_three_mm_XTUV_params(S)
+        # CPU 小形状避免使用大默认分组；基本 tile 不变。
+        if args.interpret:
+            up_params = down_params = dict(M_tiles_in_block=1, r_tiles_in_block=1,
+                                            K_tiles_in_block=1, N_tiles_in_block=1)
+        fused = jax.jit(lambda x, *f: svd_mlp_with_fused_kernel(
+            x, *f, up_params, down_params, mixed_precision=mixed, interpret=args.interpret))
+        dense = jax.jit(lambda x, *w: nki_baseline(
+            x, *w, mixed_precision=mixed, interpret=args.interpret))
+        unfused = jax.jit(_unfused_low_rank)
+        call_args = (x, *factors)
+        expected = np.asarray(jax.jit(_unfused_reference)(*call_args))
+        got = np.asarray(fused(*call_args)).astype(np.float32)
+        if not np.isfinite(got).all():
+            raise AssertionError("fused output contains NaN/Inf")
+        rel_l2 = float(np.linalg.norm(got - expected) / max(np.linalg.norm(expected), 1e-12))
+        tolerance = 0.12 if mixed else 0.001
+        if rel_l2 > tolerance:
+            raise AssertionError(f"S={S}: relative L2 error {rel_l2:.6g} > {tolerance}")
+        record = {"S": S, "up_params": up_params, "down_params": down_params,
+                  "relative_l2": rel_l2, "max_abs_error": float(np.max(np.abs(got-expected)))}
+        if not args.interpret and not args.check_only:
+            print(f"S={S}: correctness passed; compiling/warming dense and unfused baselines.", flush=True)
+            fused_ms = _time_ms(fused, call_args, args.warmup, args.repeats)
+            dense_ms = _time_ms(dense, (x, *weights), args.warmup, args.repeats)
+            unfused_ms = _time_ms(unfused, call_args, args.warmup, args.repeats)
+            record.update(fused_ms=fused_ms, dense_ms=dense_ms, unfused_low_rank_ms=unfused_ms,
+                          speedup_vs_dense=dense_ms/fused_ms, speedup_vs_unfused=unfused_ms/fused_ms)
+        print(json.dumps(record), flush=True)
+
+
+if __name__ == "__main__":
+    main()
+
+
+     
+
+

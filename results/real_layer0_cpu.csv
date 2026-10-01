@@ -1,0 +1,2 @@
+layer,S,rank,dtype,passed,fused_ms,unfused_low_rank_ms,speedup_vs_unfused,fused_relative_l2,unfused_relative_l2,max_abs_error
+0,1,2816,bfloat16,True,,,,0.005025908350944519,0.0029675413388758898,935376.0
